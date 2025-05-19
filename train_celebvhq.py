@@ -18,7 +18,7 @@ cvivit = CViViT(
 trainer = CViViTTrainer(
     cvivit,
     folder = '/workspace/datasets/CelebV-HQ/35666',
-    batch_size = 4,
+    batch_size = 8,
     grad_accum_every = 4,
     train_on_images = False,  # you can train on images first, before fine tuning on video, for sample efficiency
     use_ema = False,          # recommended to be turned on (keeps exponential moving averaged cvivit) unless if you don't have enough resources

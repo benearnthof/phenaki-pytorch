@@ -150,7 +150,7 @@ def video_to_tensor(
     frames = np.array(np.concatenate(frames[:-1], axis = 0))  # convert list of frames to numpy array
     frames = rearrange(frames, 'f h w c -> c f h w')
 
-    frames_torch = torch.tensor(frames).float()
+    frames_torch = torch.tensor(frames).float() / 255.0  # Normalize here
 
     return frames_torch[:, :num_frames, :, :]
 
@@ -171,7 +171,7 @@ def tensor_to_video(
     frames = []
 
     for idx in range(num_frames):
-        numpy_frame = tensor[:, idx, :, :].numpy()
+        numpy_frame = (tensor[:, idx, :, :].numpy() * 255.0).clip(0, 255).astype(np.uint8)
         numpy_frame = np.uint8(rearrange(numpy_frame, 'c h w -> h w c'))
         video.write(numpy_frame)
 
