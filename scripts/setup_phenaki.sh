@@ -10,3 +10,7 @@ apt-get install pigz
 pigz -dc celebvhq.tar.gz | tar -xvf - --no-same-owner
 
 find ./35666 -type f | wc -l
+
+cd /workspace/phenaki-pytorch
+pip install -e .
+
