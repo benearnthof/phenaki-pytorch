@@ -14,3 +14,22 @@ find ./35666 -type f | wc -l
 cd /workspace/phenaki-pytorch
 pip install -e .
 
+pip install accelerate
+pip install beartype
+pip install einops>=0.6
+pip install ema-pytorch>=0.1.1
+pip install opencv-python
+pip install pillow
+pip install numpy
+pip install plotly
+pip install webdataset
+pip install sentencepiece
+pip install torch==1.13.1
+pip install torchtyping
+pip install torchvision
+pip install transformers>=4.20.1
+pip install tqdm
+pip install vector-quantize-pytorch>=0.10.15
+pip install wandb
+pip install av
+pip install lpips

@@ -5,14 +5,14 @@ from phenaki_pytorch import CViViT, CViViTTrainer
 
 cvivit = CViViT(
     dim = 512,
-    codebook_size = 65536,
+    codebook_size = 8192,
     image_size = 128,
-    patch_size = 16,
+    patch_size = 8,
     temporal_patch_size = 2,
     spatial_depth = 4,
     temporal_depth = 4,
     dim_head = 64,
-    heads = 8
+    heads = 8,
 ).cuda()
 
 trainer = CViViTTrainer(

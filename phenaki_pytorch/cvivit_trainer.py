@@ -1,13 +1,24 @@
+import pdb
 from math import sqrt
 from random import choice
 from pathlib import Path
 from shutil import rmtree
+import webdataset as wds
+import torchvision.io
+import io
+import json
+import os
+import pickle
+import re
+import tempfile
+from einops import rearrange
+import time
 
 from beartype import beartype
 
 import torch
+import glob
 from torch import nn
-from torch.nn import Module
 from torch.utils.data import Dataset, DataLoader, random_split
 
 import torchvision.transforms as T
@@ -16,34 +27,43 @@ from torchvision.utils import make_grid, save_image
 
 from einops import rearrange
 
-from phenaki_pytorch.optimizer import get_optimizer
+from phenaki_pytorch.optimizer import get_optimizer, LinearWarmup_CosineAnnealing
 
 from ema_pytorch import EMA
 
 from phenaki_pytorch.cvivit import CViViT
-from phenaki_pytorch.data import ImageDataset, VideoDataset, video_tensor_to_gif
+from phenaki_pytorch.data import ImageDataset, VideoDataset, video_tensor_to_gif, video_to_tensor, video_tensor_to_pil_first_image
+from torchvision.transforms import Compose, ToTensor, ToPILImage, Resize, CenterCrop, RandomHorizontalFlip
 
 from accelerate import Accelerator
 
+import wandb
+
 # helpers
+
 
 def exists(val):
     return val is not None
 
-def noop(*args, **kwargs):
-    pass
 
 def cycle(dl):
     while True:
         for data in dl:
             yield data
 
+
+def noop(*args, **kwargs):
+    pass
+
+
 def cast_tuple(t):
     return t if isinstance(t, (tuple, list)) else (t,)
+
 
 def yes_or_no(question):
     answer = input(f'{question} (y/n) ')
     return answer.lower() in ('yes', 'y')
+
 
 def accum_log(log, new_logs):
     for key, new_value in new_logs.items():
@@ -53,44 +73,167 @@ def accum_log(log, new_logs):
 
 # main trainer class
 
+
 @beartype
-class CViViTTrainer(Module):
+class CViViTTrainer(nn.Module):
     def __init__(
         self,
-        vae: CViViT,
+        vae,
         *,
         num_train_steps,
         batch_size,
         folder,
-        train_on_images = False,
-        num_frames = 17,
-        lr = 3e-4,
-        grad_accum_every = 1,
-        wd = 0.,
-        max_grad_norm = 0.5,
-        discr_max_grad_norm = None,
-        save_results_every = 100,
-        save_model_every = 1000,
-        results_folder = './results',
-        valid_frac = 0.05,
-        random_split_seed = 42,
-        use_ema = True,
-        ema_beta = 0.995,
-        ema_update_after_step = 0,
-        ema_update_every = 1,
-        apply_grad_penalty_every = 4,
+        num_frames=11,
+        lr=3e-4,
+        grad_accum_every=1,
+        wd=0.,
+        max_grad_norm=0.5,
+        train_on_images=False,
+        force_cpu=False,
+        wandb_mode="disabled",
+        discr_max_grad_norm=None,
+        linear_warmup_start_factor=0.1,
+        linear_warmup_total_iters=100,
+        cosine_annealing_T_max=1000000,
+        cosine_annealing_eta_min=1e-5,
+        save_results_every=1000,
+        save_model_every=1000,
+        results_folder='./results',
+        scheduler_optim_overhead=0,
+        valid_frac=0.05,
+        random_split_seed=42,
+        use_ema=True,
+        ema_beta=0.995,
+        ema_update_after_step=0,
+        ema_update_every=1,
+        apply_grad_penalty_every=4,
+        inference=False,
         accelerate_kwargs: dict = dict()
     ):
         super().__init__()
+
         image_size = vae.image_size
 
-        self.accelerator = Accelerator(**accelerate_kwargs)
+        # prepare dataset and valid_dataset
+        # TO DO : split into a function ?
 
+        n_tar = len(glob.glob(folder + "/*.tar")) - 1
+        str_n_tar = str(n_tar).zfill(5)
+        valid_n_tar = int(n_tar / 100 * 10)
+        train_n_tar = n_tar - valid_n_tar - 1
+        str_train_n_tar = str(train_n_tar).zfill(5)
+
+        train_url = folder + "/{00000.." + str_train_n_tar + "}.tar"
+        valid_url = folder + \
+            "/{" + str_train_n_tar + ".." + str_n_tar + "}.tar"
+
+        print("Train_url : ", train_url)
+        print("Valid_url : ", valid_url)
+        print("Batch size : ", batch_size)
+
+        # Training on images
+        if (train_on_images):
+            transforms = Compose([Resize(image_size), CenterCrop(
+                image_size), RandomHorizontalFlip(), ToTensor()])
+
+            self.ds = wds.WebDataset(train_url)
+            self.ds.decode("pil").to_tuple(
+                "jpg").map_tuple(transforms).shuffle(1000)
+
+            self.valid_ds = wds.WebDataset(valid_url)
+            self.valid_ds.decode("pil").to_tuple(
+                "jpg").map_tuple(transforms).shuffle(1000)
+
+        # Training on videos
+        else:
+
+            def decode_and_transform(key, data):
+
+                extension = re.sub(r".*[.]", "", key)
+                if extension not in "mp4 ogv mjpeg avi mov h264 mpg webm wmv".split():
+                    return None
+
+                with tempfile.TemporaryDirectory() as dirname:
+                    fname = os.path.join(dirname, f"file.{extension}")
+                    with open(fname, "wb") as stream:
+                        stream.write(data)
+                    video = torchvision.io.read_video(fname, pts_unit="sec")[0]
+
+                    # video = rearrange(video, 'f h w c -> f c h w')
+                    # _, _, h, w = video.shape
+                    # to_crop = min(h, w)
+                    # video = CenterCrop(to_crop)(video)
+                    # video = Resize(image_size, antialias=True)(video)
+                    # video = rearrange(video, 'f c h w -> c f h w')
+
+                    video = rearrange(video, 'f h w c -> c f h w')
+
+                    video = video / 255.0
+                    return video
+
+            def my_split_by_node(urls):
+                node_id, node_count = torch.distributed.get_rank(), torch.distributed.get_world_size()
+                urls = list(urls)
+                return urls[node_id::node_count]
+
+            if (force_cpu) or torch.cuda.device_count() == 1:
+                self.ds = wds.WebDataset(train_url)
+                self.ds.decode(decode_and_transform).to_tuple(
+                    "mp4.mp4").shuffle(1000)
+                # .with_length(48)
+
+                self.valid_ds = wds.WebDataset(
+                    valid_url)
+                self.valid_ds.decode(decode_and_transform).to_tuple(
+                    "mp4.mp4").shuffle(1000)
+                # .with_length(48)
+            else:
+                self.ds = wds.WebDataset(
+                    train_url, nodesplitter=my_split_by_node)
+                self.ds.decode(decode_and_transform).to_tuple(
+                    "mp4.mp4").shuffle(1000)
+                # .with_length(48)
+
+                self.valid_ds = wds.WebDataset(
+                    valid_url, nodesplitter=my_split_by_node)
+                self.valid_ds.decode(decode_and_transform).to_tuple(
+                    "mp4.mp4").shuffle(1000)
+                # .with_length(48)
+
+        # wandb config
+        config = {}
+        arguments = locals()
+        for key in arguments.keys():
+            if key not in ['self', 'config', '__class__', 'vae']:
+                config[key] = arguments[key]
+
+        # 3. Log gradients and model parameters
+        # if (wandb_mode != "disabled"):
+        #    wandb.watch(vae, log='all', log_freq=3)
+
+        if not inference:
+            self.wandb_mode = wandb_mode
+        else:
+            self.wandb_mode = 'disabled'
+
+        from accelerate.utils import DistributedDataParallelKwargs
+        kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        self.accelerator = Accelerator(cpu=force_cpu, log_with="wandb", kwargs_handlers=[kwargs])
+        
+        self.accelerator.init_trackers(project_name="CViViT", config=config, init_kwargs={"wandb": {"mode": self.wandb_mode, "config": config}})
+
+        if self.accelerator.is_main_process:
+            print('config\n')
+            print(config)        
+        self.wandb_mode = wandb_mode
         self.vae = vae
+        self.vae.wandb_mode = wandb_mode
+        self.use_discr = vae.use_discr
 
         self.use_ema = use_ema
         if self.is_main and use_ema:
-            self.ema_vae = EMA(vae, update_after_step = ema_update_after_step, update_every = ema_update_every)
+            self.ema_vae = EMA(
+                vae, update_after_step=ema_update_after_step, update_every=ema_update_every)
 
         self.register_buffer('steps', torch.Tensor([0]))
 
@@ -98,66 +241,78 @@ class CViViTTrainer(Module):
         self.batch_size = batch_size
         self.grad_accum_every = grad_accum_every
 
-        all_parameters = set(vae.parameters())
-        discr_parameters = set(vae.discr.parameters())
-        vae_parameters = all_parameters - discr_parameters
+        all_parameters = list(vae.parameters())
+
+        non_vae_parameters = list(vae.i3d.parameters()) + \
+            list(vae.loss_fn_lpips.parameters())
+        if vae.use_discr:
+            discr_parameters = list(vae.discr.parameters())
+            non_vae_parameters = non_vae_parameters + discr_parameters
+
+        vae_parameters = []
+        for param in all_parameters:
+            if param not in set(non_vae_parameters):
+                vae_parameters.append(param)
 
         self.vae_parameters = vae_parameters
 
-        self.optim = get_optimizer(vae_parameters, lr = lr, wd = wd)
-        self.discr_optim = get_optimizer(discr_parameters, lr = lr, wd = wd)
+        self.optim = get_optimizer(vae_parameters, lr=lr, wd=wd)
+        self.scheduler_optim = LinearWarmup_CosineAnnealing(optimizer=self.optim, linear_warmup_start_factor=linear_warmup_start_factor,
+                                                            linear_warmup_total_iters=linear_warmup_total_iters, cosine_annealing_T_max=cosine_annealing_T_max, cosine_annealing_eta_min=cosine_annealing_eta_min)
+        self.scheduler_optim_overhead = scheduler_optim_overhead
+        if vae.use_discr:
+            self.discr_optim = get_optimizer(
+                discr_parameters, lr=1e-4, wd=1e-4)
 
         self.max_grad_norm = max_grad_norm
         self.discr_max_grad_norm = discr_max_grad_norm
-
-        # create dataset
-
-        dataset_klass = ImageDataset if train_on_images else VideoDataset
-
-        if train_on_images:
-            self.ds = ImageDataset(folder, image_size)
-        else:
-            self.ds = VideoDataset(folder, image_size, num_frames = num_frames)
-
-        # split for validation
-
-        if valid_frac > 0:
-            train_size = int((1 - valid_frac) * len(self.ds))
-            valid_size = len(self.ds) - train_size
-            self.ds, self.valid_ds = random_split(self.ds, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
-            self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
-        else:
-            self.valid_ds = self.ds
-            self.print(f'training with shared training and valid dataset of {len(self.ds)} samples')
 
         # dataloader
 
         self.dl = DataLoader(
             self.ds,
-            batch_size = batch_size,
-            shuffle = True
+            # self.ds.batched(batch_size),
+            batch_size=batch_size,
+            shuffle=False
         )
 
         self.valid_dl = DataLoader(
             self.valid_ds,
-            batch_size = batch_size,
-            shuffle = True
+            # self.valid_ds.batched(batch_size),
+            batch_size=batch_size,
+            shuffle=False
         )
-
         # prepare with accelerator
 
-        (
-            self.vae,
-            self.optim,
-            self.discr_optim,
-            self.dl
-        ) = self.accelerator.prepare(
-            self.vae,
-            self.optim,
-            self.discr_optim,
-            self.dl
-        )
+        if vae.use_discr:
+            (
+                self.vae,
+                self.optim,
+                self.discr_optim,
+                self.dl,
+                self.valid_dl
+            ) = self.accelerator.prepare(
+                self.vae,
+                self.optim,
+                self.discr_optim,
+                self.dl,
+                self.valid_dl
+            )
 
+        else:
+
+            (
+                self.vae,
+                self.optim,
+                self.dl,
+                self.valid_dl
+            ) = self.accelerator.prepare(
+                self.vae,
+                self.optim,
+                self.dl,
+                self.valid_dl
+            )
+        
         self.dl_iter = cycle(self.dl)
         self.valid_dl_iter = cycle(self.valid_dl)
 
@@ -168,32 +323,16 @@ class CViViTTrainer(Module):
 
         self.results_folder = Path(results_folder)
 
-        if len([*self.results_folder.glob('**/*')]) > 0 and yes_or_no('do you want to clear previous experiment checkpoints and results?'):
-            rmtree(str(self.results_folder))
-
-        self.results_folder.mkdir(parents = True, exist_ok = True)
+        self.results_folder.mkdir(parents=True, exist_ok=True)
 
     def save(self, path):
-        if not self.accelerator.is_local_main_process:
-            return
 
-        pkg = dict(
-            model = self.accelerator.get_state_dict(self.vae),
-            optim = self.optim.state_dict(),
-            discr_optim = self.discr_optim.state_dict()
-        )
-        torch.save(pkg, path)
+        self.accelerator.save_state(path)
+
+        return
 
     def load(self, path):
-        path = Path(path)
-        assert path.exists()
-        pkg = torch.load(path)
-
-        vae = self.accelerator.unwrap_model(self.vae)
-        vae.load_state_dict(pkg['model'])
-
-        self.optim.load_state_dict(pkg['optim'])
-        self.discr_optim.load_state_dict(pkg['discr_optim'])
+        self.accelerator.load_state(path)
 
     def print(self, msg):
         self.accelerator.print(msg)
@@ -227,128 +366,150 @@ class CViViTTrainer(Module):
         logs = {}
 
         # update vae (generator)
-
+        # time_cvivit = time.time()
         for _ in range(self.grad_accum_every):
-            img = next(self.dl_iter)
+            img = next(self.dl_iter)[0]
             img = img.to(device)
 
             with self.accelerator.autocast():
                 loss = self.vae(
                     img,
-                    apply_grad_penalty = apply_grad_penalty
+                    apply_grad_penalty=apply_grad_penalty,
+                    accelerator_tracker=self.accelerator
                 )
 
             self.accelerator.backward(loss / self.grad_accum_every)
 
             accum_log(logs, {'loss': loss.item() / self.grad_accum_every})
 
+            self.accelerator.log({"vae_loss": loss.item()})
+
         if exists(self.max_grad_norm):
-            self.accelerator.clip_grad_norm_(self.vae.parameters(), self.max_grad_norm)
+            self.accelerator.clip_grad_norm_(
+                self.vae.parameters(), self.max_grad_norm)
 
         self.optim.step()
         self.optim.zero_grad()
 
+        self.scheduler_optim.step(self.steps + self.scheduler_optim_overhead)
+        self.accelerator.log({"lr": self.optim.param_groups[0]["lr"]})
+
         # update discriminator
+        # DISCRIMINATOR IS NOT TRAINED ON THE SAME DATA AS THE VAE
 
-        self.accelerator.wait_for_everyone()
-
-        if exists(self.vae.discr):
+        if self.use_discr:
             self.discr_optim.zero_grad()
 
             for _ in range(self.grad_accum_every):
-                img = next(self.dl_iter)
+                img = next(self.dl_iter)[0]
                 img = img.to(device)
 
-                loss = self.vae(img, return_discr_loss = True)
+                loss = self.vae(img, return_discr_loss=True)
 
                 self.accelerator.backward(loss / self.grad_accum_every)
 
-                accum_log(logs, {'discr_loss': loss.item() / self.grad_accum_every})
+                accum_log(
+                    logs, {'discr_loss': loss.item() / self.grad_accum_every})
+
+                self.accelerator.log({"discr_loss": loss.item()})
 
             if exists(self.discr_max_grad_norm):
-                self.accelerator.clip_grad_norm_(self.vae.discr.parameters(), self.discr_max_grad_norm)
+                self.accelerator.clip_grad_norm_(
+                    self.vae.discr.parameters(), self.discr_max_grad_norm)
 
             self.discr_optim.step()
 
             # log
 
-            self.print(f"{steps}: vae loss: {logs['loss']} - discr loss: {logs['discr_loss']}")
+            self.print(
+                f"{steps}: vae loss: {logs['loss']} - discr loss: {logs['discr_loss']}")
+
+        self.print(f"{steps}: vae loss: {logs['loss']}")
 
         # update exponential moving averaged generator
-
-        self.accelerator.wait_for_everyone()
 
         if self.is_main and self.use_ema:
             self.ema_vae.update()
 
         # sample results every so often
 
-        self.accelerator.wait_for_everyone()
+        if (self.steps == 0):
+            self.valid_data_to_log = next(self.valid_dl_iter)[0]
 
-        if self.is_main and not (steps % self.save_results_every):
-            unwrapped_vae = self.accelerator.unwrap_model(self.vae)
-            vaes_to_evaluate = ((unwrapped_vae, str(steps)),)
+        if not (steps % self.save_results_every):
+            vaes_to_evaluate = ((self.vae, str(steps)),)
 
             if self.use_ema:
-                vaes_to_evaluate = ((self.ema_vae.ema_model, f'{steps}.ema'),) + vaes_to_evaluate
+                vaes_to_evaluate = (
+                    (self.ema_vae.ema_model, f'{steps}.ema'),) + vaes_to_evaluate
 
             for model, filename in vaes_to_evaluate:
                 model.eval()
 
-                valid_data = next(self.valid_dl_iter)
+                valid_data = next(self.valid_dl_iter)[0]
 
                 is_video = valid_data.ndim == 5
 
                 valid_data = valid_data.to(device)
 
-                recons = model(valid_data, return_recons_only = True)
+                recons = model(self.valid_data_to_log, return_recons_only=True)
 
                 # if is video, save gifs to folder
                 # else save a grid of images
 
                 if is_video:
-                    sampled_videos_path = self.results_folder / f'samples.{filename}'
-                    (sampled_videos_path).mkdir(parents = True, exist_ok = True)
+                    sampled_videos_path = self.results_folder / \
+                        f'samples.{filename}'
+                    (sampled_videos_path).mkdir(parents=True, exist_ok=True)
 
-                    for tensor in recons.unbind(dim = 0):
-                        video_tensor_to_gif(tensor, str(sampled_videos_path / f'{filename}.gif'))
+                    for i, tensor in enumerate(recons.unbind(dim=0)):
+                        video_tensor_to_gif(tensor.cpu(), str(
+                            sampled_videos_path / f'{filename}-{i}.gif'))
+
+                        if (i < 4):
+                            self.accelerator.log({
+                                f"image{i}": [wandb.Image(video_tensor_to_pil_first_image(tensor.cpu())), wandb.Image(video_tensor_to_pil_first_image(self.valid_data_to_log[i].cpu()))],
+                            })
+
+
                 else:
-                    imgs_and_recons = torch.stack((valid_data, recons), dim = 0)
-                    imgs_and_recons = rearrange(imgs_and_recons, 'r b ... -> (b r) ...')
+                    imgs_and_recons = torch.stack((valid_data, recons), dim=0)
+                    imgs_and_recons = rearrange(
+                        imgs_and_recons, 'r b ... -> (b r) ...')
 
                     imgs_and_recons = imgs_and_recons.detach().cpu().float().clamp(0., 1.)
-                    grid = make_grid(imgs_and_recons, nrow = 2, normalize = True, value_range = (0, 1))
+                    grid = make_grid(imgs_and_recons, nrow=2,
+                                     normalize=True, range=(0, 1))
 
                     logs['reconstructions'] = grid
 
-                    save_image(grid, str(self.results_folder / f'{filename}.png'))
+                    save_image(
+                        grid, str(self.results_folder / f'{filename}.png'))
 
             self.print(f'{steps}: saving to {str(self.results_folder)}')
 
         # save model every so often
 
-        self.accelerator.wait_for_everyone()
-
         if self.is_main and not (steps % self.save_model_every):
-            state_dict = self.vae.state_dict()
-            model_path = str(self.results_folder / f'vae.{steps}.pt')
-            torch.save(state_dict, model_path)
 
-            if self.use_ema:
-                ema_state_dict = self.ema_vae.state_dict()
-                model_path = str(self.results_folder / f'vae.{steps}.ema.pt')
-                torch.save(ema_state_dict, model_path)
+            save_path = Path(
+                str(self.results_folder / f'ckpt_accelerate_{steps}/'))
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            self.save(save_path)
 
-            self.print(f'{steps}: saving model to {str(self.results_folder)}')
+            self.print(f'{steps}: saving model to {str(save_path)}')
 
         self.steps += 1
         return logs
 
-    def train(self, log_fn = noop):
-        device = next(self.vae.parameters()).device
+    def train(self, log_fn=noop):
+        # device = next(self.vae.parameters())[0].device
 
         while self.steps < self.num_train_steps:
+            timestep_wallclock_time = time.time()
             logs = self.train_step()
             log_fn(logs)
+            print(time.time()-timestep_wallclock_time,
+                  'time taken to perform one timestep')
 
         self.print('training complete')
