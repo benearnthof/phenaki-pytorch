@@ -11,6 +11,8 @@ pigz -dc celebvhq.tar.gz | tar -xvf - --no-same-owner
 
 find ./35666 -type f | wc -l
 
+source /workspace/venv/bin/activate
+
 cd /workspace/phenaki-pytorch
 pip install -e .
 
@@ -33,3 +35,42 @@ pip install vector-quantize-pytorch>=0.10.15
 pip install wandb
 pip install av
 pip install lpips
+pip install google-cloud-storage
+pip install nibabel
+pip install prettytable
+pip install tensorhue
+# setup gcloud
+export GOOGLE_APPLICATION_CREDENTIALS="/workspace/ldm100k-dl-95af770e42ef.json"
+
+apt-get install apt-transport-https ca-certificates gnupg curl
+curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+apt-get update && apt-get install google-cloud-cli
+
+gcloud init
+gcloud auth login --no-launch-browser
+gcloud config set project ldm100k
+gcloud storage ls gs://ldm100k-bucket
+
+gsutil cat gs://ldm100k-bucket/shards/shard-0000000.tar
+
+echo "deb http://packages.cloud.google.com/apt gcsfuse-bionic main" > /etc/apt/sources.list.d/gcsfuse.list
+curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+apt -qq update
+apt -qq install fuse gcsfuse
+
+apt-get update && apt-get install -y fuse kmod
+apt-get update && apt-get install -y fuse gcsfuse
+
+# mounting virtual drive
+cd /workspace/
+mkdir -p /workspace/mnt/ldm100k
+gcsfuse --implicit-dirs ldm100k-bucket /workspace/mnt/ldm100k
+
+# need explicit list of shards since we cannot mount on vm
+gsutil ls gs://ldm100k-bucket/shards/ > ldm100k_shards.txt
+
+gsutil iam ch allUsers:objectViewer gs://ldm100k-bucket
+
+# signurls
+# gsutil signurl -d 1h /workspace/ldm100k-dl-95af770e42ef.json gs://ldm100k-bucket/shards/shard-*.tar
