@@ -33,12 +33,21 @@ import torch
 dataloader = torch.utils.data.DataLoader(dataset, batch_size=4, num_workers=2)
 sample = next(iter(dataloader))
 
+dl_iter = iter(dataloader)
+
+import json
+
+for i in range(0, 100, 1):
+    sample = next(dl_iter)
+    metadata = [json.loads(x) for x in sample["json"]]
+    print(f"Sample {i}: {metadata[0].get('age')}")
+
 sample["json"]
 sample["__key__"]
 
 import glob
 import nibabel as nib
-import json
+
 import io
 import gzip
 from tensorhue import viz
