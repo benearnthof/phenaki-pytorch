@@ -83,3 +83,33 @@ from scipy.ndimage import zoom
 subsampled = zoom(img_slice, zoom=0.5, order=1)  # order=1 is bilinear interpolation
 
 viz(subsampled)
+
+
+# In memory webdataset
+
+import os
+import webdataset as wds
+
+# Path to your raw video files
+video_folder = "/workspace/datasets/CelebV-HQ/35666"
+
+# Collect all mp4 paths
+video_paths = [os.path.join(video_folder, f) for f in os.listdir(video_folder) if f.endswith(".mp4")]
+
+# Create a synthetic webdataset-style iterable
+def generator():
+    for path in video_paths:
+        key = os.path.splitext(os.path.basename(path))[0]
+        with open(path, "rb") as f:
+            video_bytes = f.read()
+        # Emit a "sample" in WebDataset format
+        yield {
+            "__key__": key,
+            "mp4": video_bytes
+        }
+
+# Wrap with webdataset
+dataset = wds.DataPipeline(
+    generator,
+    wds.to_tuple("mp4"),  # you can adjust this depending on your model’s expected tuple format
+)

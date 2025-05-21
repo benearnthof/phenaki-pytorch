@@ -122,7 +122,7 @@ class CViViTTrainer(nn.Module):
         valid_n_tar = int(n_tar / 100 * 10)
         train_n_tar = n_tar - valid_n_tar - 1
         str_train_n_tar = str(train_n_tar).zfill(5)
-
+        # TODO: adjust to ldm100k numbering scheme
         train_url = folder + "/{00000.." + str_train_n_tar + "}.tar"
         valid_url = folder + \
             "/{" + str_train_n_tar + ".." + str_n_tar + "}.tar"
@@ -146,7 +146,7 @@ class CViViTTrainer(nn.Module):
 
         # Training on videos
         else:
-
+            # TODO: adjust this to LDM100k
             def decode_and_transform(key, data):
 
                 extension = re.sub(r".*[.]", "", key)
@@ -171,34 +171,92 @@ class CViViTTrainer(nn.Module):
                     video = video / 255.0
                     return video
 
+            def decode_video(data):
+                NUM_FRAMES = 16
+                with tempfile.TemporaryDirectory() as dirname:
+                    fname = os.path.join(dirname, "file.mp4")
+                    with open(fname, "wb") as stream:
+                        stream.write(data)
+                    video = torchvision.io.read_video(fname, pts_unit="sec")[0]
+                    video = rearrange(video, 'f h w c -> c f h w')
+                    c, f, h, w = video.shape
+                    if f >= NUM_FRAMES:
+                        video = video[:, :NUM_FRAMES]  # truncate
+                    else:
+                        pad = torch.zeros((c, NUM_FRAMES - f, h, w), dtype=video.dtype, device=video.device)
+                        video = torch.cat([video, pad], dim=1)
+                    return video / 255.0
+
             def my_split_by_node(urls):
                 node_id, node_count = torch.distributed.get_rank(), torch.distributed.get_world_size()
                 urls = list(urls)
                 return urls[node_id::node_count]
 
+            # mock webdataset from local folder
+            video_paths = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".mp4")]
+
+            def video_generator():
+                for path in video_paths:
+                    key = os.path.splitext(os.path.basename(path))[0]
+                    with open(path, "rb") as f:
+                        video_bytes = f.read()
+                    # Emit a "sample" in WebDataset format
+                    yield {
+                        "__key__": key,
+                        "mp4": video_bytes
+                    }
+
             if (force_cpu) or torch.cuda.device_count() == 1:
-                self.ds = wds.WebDataset(train_url)
-                self.ds.decode(decode_and_transform).to_tuple(
-                    "mp4.mp4").shuffle(1000)
-                # .with_length(48)
+                if not n_tar == -1:
+                    self.ds = wds.WebDataset(train_url)
+                    self.ds.decode(decode_and_transform).to_tuple(
+                        "mp4.mp4").shuffle(1000)
+                    # .with_length(48)
 
-                self.valid_ds = wds.WebDataset(
-                    valid_url)
-                self.valid_ds.decode(decode_and_transform).to_tuple(
-                    "mp4.mp4").shuffle(1000)
-                # .with_length(48)
+                    self.valid_ds = wds.WebDataset(
+                        valid_url)
+                    self.valid_ds.decode(decode_and_transform).to_tuple(
+                        "mp4.mp4").shuffle(1000)
+                    # .with_length(48)
+                else:
+                    self.ds = wds.DataPipeline(
+                        video_generator,
+                        wds.map_dict(mp4=decode_video),
+                        wds.to_tuple("mp4")
+                        )
+                    # self.ds.decode(decode_video).to_tuple("mp4.mp4")
+                    self.valid_ds = wds.DataPipeline(
+                        video_generator,
+                        wds.map_dict(mp4=decode_video),
+                        wds.to_tuple("mp4")
+                        )
+                    #self.valid_ds.decode(decode_video).to_tuple("mp4.mp4")
             else:
-                self.ds = wds.WebDataset(
-                    train_url, nodesplitter=my_split_by_node)
-                self.ds.decode(decode_and_transform).to_tuple(
-                    "mp4.mp4").shuffle(1000)
-                # .with_length(48)
+                if not n_tar == -1:
+                    self.ds = wds.WebDataset(
+                        train_url, nodesplitter=my_split_by_node)
+                    self.ds.decode(decode_and_transform).to_tuple(
+                        "mp4.mp4").shuffle(1000)
+                    # .with_length(48)
 
-                self.valid_ds = wds.WebDataset(
-                    valid_url, nodesplitter=my_split_by_node)
-                self.valid_ds.decode(decode_and_transform).to_tuple(
-                    "mp4.mp4").shuffle(1000)
-                # .with_length(48)
+                    self.valid_ds = wds.WebDataset(
+                        valid_url, nodesplitter=my_split_by_node)
+                    self.valid_ds.decode(decode_and_transform).to_tuple(
+                        "mp4.mp4").shuffle(1000)
+                    # .with_length(48)
+                else:
+                    self.ds = wds.DataPipeline(
+                        video_generator,
+                        wds.map_dict(mp4=decode_video),
+                        wds.to_tuple("mp4")
+                        )
+                    # self.ds.decode(decode_video).to_tuple("mp4.mp4")
+                    self.valid_ds = wds.DataPipeline(
+                        video_generator,
+                        wds.map_dict(mp4=decode_video),
+                        wds.to_tuple("mp4")
+                        )
+                    #self.valid_ds.decode(decode_video).to_tuple("mp4.mp4")
 
         # wandb config
         config = {}
